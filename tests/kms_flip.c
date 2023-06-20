@@ -49,6 +49,7 @@
 
 #include "i915/gem_create.h"
 #include "igt_stats.h"
+#include "igt_sysfs.h"
 #include "xe/xe_query.h"
 
 #define TEST_DPMS		(1 << 0)
@@ -75,6 +76,7 @@
 #define TEST_ENOENT		(1 << 22)
 #define TEST_FENCE_STRESS	(1 << 23)
 #define TEST_VBLANK_RACE	(1 << 24)
+#define TEST_MOD4_RECLAIM	(1 << 25)
 #define TEST_SUSPEND		(1 << 26)
 #define TEST_BO_TOOBIG		(1 << 28)
 
@@ -1356,6 +1358,9 @@ restart:
 	if (o->flags & TEST_FENCE_STRESS)
 		modifier = I915_FORMAT_MOD_X_TILED;
 
+	if (o->flags & TEST_MOD4_RECLAIM)
+		modifier = I915_FORMAT_MOD_4_TILED;
+
 	/* 256 MB is usually the maximum mappable aperture,
 	 * (make it 4x times that to ensure failure) */
 	if (o->flags & TEST_BO_TOOBIG) {
@@ -1497,6 +1502,47 @@ out:
 	igt_cleanup_uevents(mon);
 }
 
+static void reclaim(int timeout)
+{
+        const uint64_t timeout_100ms = 100000000LL;
+        int fd = drm_fd;
+        int debugfs = igt_debugfs_dir(fd);
+        igt_spin_t *spin;
+        volatile uint32_t *shared;
+        unsigned engine = I915_EXEC_DEFAULT;
+        uint64_t ahnd = get_reloc_ahnd(fd, 0);
+
+        shared = mmap(0, 4096, PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+        igt_assert(shared != MAP_FAILED);
+
+        igt_fork(child, sysconf(_SC_NPROCESSORS_ONLN)) {
+                do {
+                        igt_sysfs_printf(debugfs, "i915_drop_caches",
+                                        "%d", DROP_BOUND | DROP_UNBOUND);
+                } while (!*shared);
+        }
+
+        spin = igt_spin_new(fd, .ahnd = ahnd, .engine = engine);
+        igt_until_timeout(timeout) {
+                igt_spin_t *next = __igt_spin_new(fd, .ahnd = ahnd, .engine = engine);
+
+                igt_spin_set_timeout(spin, timeout_100ms);
+                gem_sync(fd, spin->handle);
+
+                igt_spin_free(fd, spin);
+                spin = next;
+        }
+        igt_spin_free(fd, spin);
+        put_ahnd(ahnd);
+
+        *shared = 1;
+        igt_waitchildren();
+
+        munmap((void *)shared, 4096);
+        close(debugfs);
+        close(fd);
+}
+
 static void run_test_on_crtc_set(struct test_output *o, int *crtc_idxs,
 				 int crtc_count, int total_crtcs,
 				 int duration_ms)
@@ -1595,6 +1641,10 @@ static void run_test(int duration, int flags)
 	if (flags & TEST_BO_TOOBIG && !is_intel_device(drm_fd))
 		return;
 
+	if (flags & TEST_MOD4_RECLAIM && (!is_intel_device(drm_fd) ||
+	    intel_display_ver(intel_get_drm_devid(drm_fd))))
+		return;
+
 	igt_require((flags & TEST_HANG) == 0 ||
 		    (is_i915_device(drm_fd) && !is_wedged(drm_fd)));
 	igt_require(!(flags & TEST_FENCE_STRESS) ||
@@ -1632,6 +1682,9 @@ static void run_test(int duration, int flags)
 		duration = duration * 1000 / modes;
 		duration = max(500, duration);
 	}
+
+	if (flags & TEST_MOD4_RECLAIM)
+		reclaim(duration);
 
 	/* Find any connected displays */
 	for (i = 0; i < resources->count_connectors; i++) {
@@ -1846,6 +1899,7 @@ igt_main_args("e", NULL, help_str, opt_handler, NULL)
 		{ 10, TEST_MODESET | TEST_VBLANK_RACE | TEST_CHECK_TS, "modeset-vs-vblank-race" },
 		{ 0, TEST_BO_TOOBIG | TEST_NO_2X_OUTPUT, "bo-too-big" },
 		{ 10, TEST_FLIP | TEST_SUSPEND, "flip-vs-suspend" },
+		{ 60, TEST_FLIP | TEST_MOD4_RECLAIM, "flip-vs-mod4-reclaim" },
 	};
 	int i;
 
